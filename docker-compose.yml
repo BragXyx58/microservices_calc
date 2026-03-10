@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
 
   db:
@@ -22,5 +20,13 @@ services:
     build: ./calculator_service
     ports:
       - "8002:8000"
+    depends_on:
+      - db
+      - history_service
+
+  history_service:
+    build: ./history_service
+    ports:
+      - "8003:8000"
     depends_on:
       - db
