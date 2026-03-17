@@ -1,14 +1,20 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import redis
+from urllib.parse import urlparse, parse_qs
 from database import get_connection
+
+redis_client = redis.Redis(
+    host="redis",
+    port=6379,
+    password="redis123",
+    decode_responses=True
+)
 
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-        history = []
         try:
-            from urllib.parse import urlparse, parse_qs
-
             parsed = urlparse(self.path)
 
             if parsed.path == "/history":
@@ -23,13 +29,19 @@ class Handler(BaseHTTPRequestHandler):
                     username
                 )
                 user_row = cursor.fetchone()
+
                 if not user_row:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "User not found"}).encode())
+                    conn.close()
+                    self.respond(404, {"error": "User not found"})
                     return
 
                 user_id = user_row[0]
+
+                cached_history = redis_client.get(f"history:{user_id}")
+                if cached_history:
+                    conn.close()
+                    self.respond(200, json.loads(cached_history))
+                    return
 
                 cursor.execute(
                     "SELECT Id, Expression, Result, CreatedAt FROM History WHERE UserId = ? ORDER BY CreatedAt ASC",
@@ -37,7 +49,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 rows = cursor.fetchall()
+                conn.close()
 
+                history = []
                 for r in rows:
                     history.append({
                         "id": r[0],
@@ -46,16 +60,17 @@ class Handler(BaseHTTPRequestHandler):
                         "created_at": str(r[3])[:19]
                     })
 
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(history).encode())
+                redis_client.setex(
+                    f"history:{user_id}",
+                    60,
+                    json.dumps(history)
+                )
+
+                self.respond(200, history)
 
         except Exception as e:
             print("ERROR GET /history:", e)
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.respond(500, {"error": str(e)})
 
     def do_POST(self):
         try:
@@ -71,10 +86,10 @@ class Handler(BaseHTTPRequestHandler):
                     data["username"]
                 )
                 user_row = cursor.fetchone()
+
                 if not user_row:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "User not found"}).encode())
+                    conn.close()
+                    self.respond(404, {"error": "User not found"})
                     return
 
                 user_id = user_row[0]
@@ -87,36 +102,44 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 conn.commit()
-                self.send_response(200)
-                self.end_headers()
+                conn.close()
 
+                redis_client.delete(f"history:{user_id}")
+
+                self.respond(200, {"message": "saved"})
 
             elif self.path == "/rollback":
                 cursor.execute(
-                    "SELECT Result, Expression FROM History WHERE Id = ?",
+                    "SELECT UserId, Result, Expression FROM History WHERE Id = ?",
                     data["id"]
                 )
                 row = cursor.fetchone()
+                conn.close()
+
                 if not row:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "Operation not found"}).encode())
+                    self.respond(404, {"error": "Operation not found"})
                     return
-                result = row[0]
-                expression = row[1]
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({
+
+                user_id = row[0]
+                result = row[1]
+                expression = row[2]
+
+                redis_client.delete(f"history:{user_id}")
+
+                self.respond(200, {
                     "result": result,
                     "expression": expression
-                }).encode())
+                })
 
         except Exception as e:
             print("ERROR POST:", e)
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.respond(500, {"error": str(e)})
+
+    def respond(self, status_code, data):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
 
 server = HTTPServer(("0.0.0.0", 8000), Handler)
 print("History service running on port 8000...")

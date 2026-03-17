@@ -9,12 +9,27 @@ services:
     ports:
       - "1433:1433"
 
+  redis:
+    image: redis:latest
+    container_name: redis_container
+    command: redis-server --appendonly yes --requirepass redis123
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis123", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   auth_service:
     build: ./auth_service
     ports:
       - "8001:8000"
     depends_on:
       - db
+      - redis
 
   calculator_service:
     build: ./calculator_service
@@ -23,6 +38,7 @@ services:
     depends_on:
       - db
       - history_service
+      - redis
 
   history_service:
     build: ./history_service
@@ -30,3 +46,4 @@ services:
       - "8003:8000"
     depends_on:
       - db
+      - redis

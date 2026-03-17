@@ -2,7 +2,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import hashlib
 import uuid
+import redis
 from database import get_connection
+
+redis_client = redis.Redis(
+    host="redis",
+    port=6379,
+    password="redis123",
+    decode_responses=True
+)
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -10,69 +18,109 @@ def hash_password(password):
 class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
+        try:
+            content_length = int(self.headers["Content-Length"])
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
 
-        if self.path == "/register":
-            self.register(data)
+            if self.path == "/register":
+                self.register(data)
+            elif self.path == "/login":
+                self.login(data)
+            else:
+                self.respond(404, {"error": "not found"})
 
-        elif self.path == "/login":
-            self.login(data)
+        except Exception as e:
+            print("ERROR do_POST:", e)
+            self.respond(500, {"error": str(e)})
 
     def register(self, data):
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = None
 
-        hashed = hash_password(data["password"])
+        try:
+            username = data["username"]
+            password = data["password"]
 
-        cursor.execute(
-            "INSERT INTO Users (Username, PasswordHash) VALUES (?, ?)",
-            data["username"],
-            hashed
-        )
+            conn = get_connection()
+            cursor = conn.cursor()
 
-        conn.commit()
-        conn.close()
+            cursor.execute(
+                "SELECT Id FROM Users WHERE Username = ?",
+                username
+            )
+            existing_user = cursor.fetchone()
 
-        self.respond({"message": "registered"})
+            if existing_user:
+                self.respond(409, {"error": "user already exists"})
+                return
+
+            hashed = hash_password(password)
+
+            cursor.execute(
+                "INSERT INTO Users (Username, PasswordHash) VALUES (?, ?)",
+                username,
+                hashed
+            )
+
+            conn.commit()
+            self.respond(200, {"message": "registered"})
+
+        except Exception as e:
+            print("ERROR register:", e)
+            self.respond(500, {"error": str(e)})
+
+        finally:
+            if conn:
+                conn.close()
 
     def login(self, data):
-        conn = get_connection()
-        cursor = conn.cursor()
+        conn = None
 
-        hashed = hash_password(data["password"])
+        try:
+            username = data["username"]
+            password = data["password"]
+            hashed = hash_password(password)
 
-        cursor.execute(
-            "SELECT Id FROM Users WHERE Username=? AND PasswordHash=?",
-            data["username"],
-            hashed
-        )
+            conn = get_connection()
+            cursor = conn.cursor()
 
-        row = cursor.fetchone()
+            cursor.execute(
+                "SELECT Id FROM Users WHERE Username = ? AND PasswordHash = ?",
+                username,
+                hashed
+            )
 
-        if not row:
-            self.respond({"error": "invalid credentials"})
-            return
+            row = cursor.fetchone()
 
-        session_token = str(uuid.uuid4())
+            if not row:
+                self.respond(401, {"error": "invalid credentials"})
+                return
 
-        cursor.execute(
-            "INSERT INTO Sessions (UserId, SessionToken) VALUES (?, ?)",
-            row[0],
-            session_token
-        )
+            user_id = row[0]
+            session_token = str(uuid.uuid4())
 
-        conn.commit()
-        conn.close()
+            redis_client.setex(
+                f"session:{session_token}",
+                3600,
+                user_id
+            )
 
-        self.respond({"session_token": session_token})
+            self.respond(200, {"session_token": session_token})
 
-    def respond(self, data):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
+        except Exception as e:
+            print("ERROR login:", e)
+            self.respond(500, {"error": str(e)})
+
+        finally:
+            if conn:
+                conn.close()
+
+    def respond(self, status_code, data):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
 server = HTTPServer(("0.0.0.0", 8000), Handler)
+print("Auth service running on port 8000...")
 server.serve_forever()
